@@ -22,7 +22,9 @@
   .card .sub { font-size:13px; color:var(--muted); font-weight:400; }
   .lamp { width:14px; height:14px; border-radius:50%; background:var(--off); flex:none; }
   .lamp.on { background:var(--on); box-shadow:0 0 8px var(--on); }
-  .lamp.stale { opacity:.45; box-shadow:none; }
+  .loader { background:var(--card); border-radius:14px; padding:28px 16px; text-align:center; color:var(--muted); }
+  .spin { width:28px; height:28px; margin:0 auto 12px; border-radius:50%; border:3px solid var(--off); border-top-color:var(--accent); animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   button { font:inherit; border:0; border-radius:10px; padding:10px 16px; background:var(--accent); color:#fff; min-width:96px; }
   button:disabled { opacity:.4; }
   button.secondary { background:transparent; color:var(--accent); padding:6px 0; min-width:0; }
@@ -52,7 +54,8 @@
 
 <div id="main" class="hidden">
   <div class="status"><span id="dot" class="dot"></span><span id="statusText">Подключение…</span></div>
-  <div id="list"></div>
+  <div id="loader" class="loader"><div class="spin"></div><span id="loaderText">Получаем состояние от ПЛК…</span></div>
+  <div id="list" class="hidden"></div>
   <div class="foot">
     <span id="lastSeen">ПЛК ещё не прислал данные</span><br>
     <button class="secondary" id="logout">Выйти (забыть пароль на этом устройстве)</button>
@@ -65,8 +68,6 @@
 const BROKER = "wss://q4717677.ala.eu-central-1.emqxsl.com:8084/mqtt";
 const TOPIC_STATE = "home/logo/state";
 const TOPIC_SET = "home/logo/set";
-// Последнее состояние, которое брокер хранит (retain) через правило Republish в EMQX — приходит сразу при подключении.
-const TOPIC_LAST = "home/logo/last";
 const HEARTBEAT_KEY = "V..2:990-6";
 
 // Чтобы добавить выход или флаг: допишите строку сюда и включите его
@@ -80,29 +81,31 @@ const ITEMS = [
 
 const $ = id => document.getElementById(id);
 const STORE = "logo-web-cred";
-const STATE_STORE = "logo-web-state";
-// Последнее известное состояние показываем сразу, пока ПЛК не прислал свежее.
-const state = (() => { try { return JSON.parse(localStorage.getItem(STATE_STORE)) || {}; } catch { return {}; } })();
-const fresh = {};
+const state = {};
 let client = null;
+let slowTimer = null;
 
 function loadCred() { try { return JSON.parse(localStorage.getItem(STORE)); } catch { return null; } }
 function saveCred(c) { try { localStorage.setItem(STORE, JSON.stringify(c)); } catch {} }
 function clearCred() { try { localStorage.removeItem(STORE); } catch {} }
 
+// Карточки показываем только когда от ПЛК пришли все значения из ITEMS.
 function render() {
+  const ready = ITEMS.every(it => it.key in state);
+  $("loader").classList.toggle("hidden", ready);
+  $("list").classList.toggle("hidden", !ready);
+  if (!ready) return;
   $("list").innerHTML = "";
   for (const it of ITEMS) {
     const v = state[it.key];
     const card = document.createElement("div");
     card.className = "card";
-    const text = v === undefined ? "загрузка…" : (v ? "Включено" : "Выключено") + (fresh[it.key] ? "" : " (обновляется…)");
-    card.innerHTML = `<span class="lamp ${v ? "on" : ""} ${fresh[it.key] ? "" : "stale"}"></span>
-      <div class="name">${it.name}<div class="sub">${text} · ${it.sub || ""}</div></div>`;
+    card.innerHTML = `<span class="lamp ${v ? "on" : ""}"></span>
+      <div class="name">${it.name}<div class="sub">${v ? "Включено" : "Выключено"} · ${it.sub || ""}</div></div>`;
     if (it.writable) {
       const b = document.createElement("button");
-      b.textContent = v === undefined ? "…" : v ? "Выключить" : "Включить";
-      b.disabled = !client || !client.connected || v === undefined;
+      b.textContent = v ? "Выключить" : "Включить";
+      b.disabled = !client || !client.connected;
       b.onclick = () => setValue(it.key, !v);
       card.appendChild(b);
     }
@@ -138,8 +141,7 @@ function onMessage(topic, payload) {
   try { data = JSON.parse(payload.toString()); } catch { return; }
   const found = {};
   collect(data, found);
-  for (const it of ITEMS) if (it.key in found) { state[it.key] = toBool(found[it.key]); fresh[it.key] = true; }
-  try { localStorage.setItem(STATE_STORE, JSON.stringify(state)); } catch {}
+  for (const it of ITEMS) if (it.key in found) state[it.key] = toBool(found[it.key]);
   $("lastSeen").textContent = "Последние данные от ПЛК: " + new Date().toLocaleTimeString("ru-RU");
   render();
 }
@@ -155,6 +157,9 @@ function connect(cred) {
   $("main").classList.remove("hidden");
   render();
   setStatus("Подключение…");
+  // LOGO шлёт состояние раз в несколько секунд; если долго тишина — подсказываем.
+  clearTimeout(slowTimer);
+  slowTimer = setTimeout(() => { $("loaderText").textContent = "ПЛК пока не прислал данные. Проверьте, что он включён и подключён к интернету."; }, 25000);
   client = mqtt.connect(BROKER, {
     username: cred.user, password: cred.pass,
     clientId: "web-" + Math.random().toString(16).slice(2, 10),
@@ -162,7 +167,7 @@ function connect(cred) {
   });
   client.on("connect", () => {
     setStatus("Подключено", "ok");
-    client.subscribe([TOPIC_STATE, TOPIC_LAST], { qos: 1 });
+    client.subscribe(TOPIC_STATE, { qos: 1 });
     render();
   });
   client.on("message", onMessage);
