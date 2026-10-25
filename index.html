@@ -22,6 +22,7 @@
   .card .sub { font-size:13px; color:var(--muted); font-weight:400; }
   .lamp { width:14px; height:14px; border-radius:50%; background:var(--off); flex:none; }
   .lamp.on { background:var(--on); box-shadow:0 0 8px var(--on); }
+  .lamp.stale { opacity:.45; box-shadow:none; }
   button { font:inherit; border:0; border-radius:10px; padding:10px 16px; background:var(--accent); color:#fff; min-width:96px; }
   button:disabled { opacity:.4; }
   button.secondary { background:transparent; color:var(--accent); padding:6px 0; min-width:0; }
@@ -64,6 +65,8 @@
 const BROKER = "wss://q4717677.ala.eu-central-1.emqxsl.com:8084/mqtt";
 const TOPIC_STATE = "home/logo/state";
 const TOPIC_SET = "home/logo/set";
+// Последнее состояние, которое брокер хранит (retain) через правило Republish в EMQX — приходит сразу при подключении.
+const TOPIC_LAST = "home/logo/last";
 const HEARTBEAT_KEY = "V..2:990-6";
 
 // Чтобы добавить выход или флаг: допишите строку сюда и включите его
@@ -77,7 +80,10 @@ const ITEMS = [
 
 const $ = id => document.getElementById(id);
 const STORE = "logo-web-cred";
-const state = {};
+const STATE_STORE = "logo-web-state";
+// Последнее известное состояние показываем сразу, пока ПЛК не прислал свежее.
+const state = (() => { try { return JSON.parse(localStorage.getItem(STATE_STORE)) || {}; } catch { return {}; } })();
+const fresh = {};
 let client = null;
 
 function loadCred() { try { return JSON.parse(localStorage.getItem(STORE)); } catch { return null; } }
@@ -90,19 +96,15 @@ function render() {
     const v = state[it.key];
     const card = document.createElement("div");
     card.className = "card";
-    card.innerHTML = `<span class="lamp ${v ? "on" : ""}"></span>
-      <div class="name">${it.name}<div class="sub">${v === undefined ? "нет данных" : v ? "Включено" : "Выключено"} · ${it.sub || ""}</div></div>`;
+    const text = v === undefined ? "загрузка…" : (v ? "Включено" : "Выключено") + (fresh[it.key] ? "" : " (обновляется…)");
+    card.innerHTML = `<span class="lamp ${v ? "on" : ""} ${fresh[it.key] ? "" : "stale"}"></span>
+      <div class="name">${it.name}<div class="sub">${text} · ${it.sub || ""}</div></div>`;
     if (it.writable) {
-      // Пока состояние неизвестно (LOGO шлёт его только при изменении) — две кнопки.
-      const targets = v === undefined ? [true, false] : [!v];
-      for (const on of targets) {
-        const b = document.createElement("button");
-        b.textContent = v === undefined ? (on ? "Вкл" : "Выкл") : (on ? "Включить" : "Выключить");
-        if (targets.length > 1) b.style.minWidth = "64px";
-        b.disabled = !client || !client.connected;
-        b.onclick = () => setValue(it.key, on);
-        card.appendChild(b);
-      }
+      const b = document.createElement("button");
+      b.textContent = v === undefined ? "…" : v ? "Выключить" : "Включить";
+      b.disabled = !client || !client.connected || v === undefined;
+      b.onclick = () => setValue(it.key, !v);
+      card.appendChild(b);
     }
     $("list").appendChild(card);
   }
@@ -136,7 +138,8 @@ function onMessage(topic, payload) {
   try { data = JSON.parse(payload.toString()); } catch { return; }
   const found = {};
   collect(data, found);
-  for (const it of ITEMS) if (it.key in found) state[it.key] = toBool(found[it.key]);
+  for (const it of ITEMS) if (it.key in found) { state[it.key] = toBool(found[it.key]); fresh[it.key] = true; }
+  try { localStorage.setItem(STATE_STORE, JSON.stringify(state)); } catch {}
   $("lastSeen").textContent = "Последние данные от ПЛК: " + new Date().toLocaleTimeString("ru-RU");
   render();
 }
@@ -159,7 +162,7 @@ function connect(cred) {
   });
   client.on("connect", () => {
     setStatus("Подключено", "ok");
-    client.subscribe(TOPIC_STATE, { qos: 1 });
+    client.subscribe([TOPIC_STATE, TOPIC_LAST], { qos: 1 });
     render();
   });
   client.on("message", onMessage);
