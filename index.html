@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Дом">
+<meta name="theme-color" content="#111418">
+<title>Управление домом</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --text:#15181c; --muted:#6b7280; --on:#16a34a; --off:#9ca3af; --accent:#2563eb; --err:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1c2026; --text:#e8eaed; --muted:#9aa1ab; --off:#4b5563; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system, system-ui, sans-serif;
+         padding:16px; padding-top:max(16px, env(safe-area-inset-top)); max-width:560px; margin-inline:auto; }
+  h1 { font-size:22px; margin:4px 0 12px; }
+  .status { font-size:14px; color:var(--muted); margin-bottom:16px; display:flex; align-items:center; gap:8px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--off); flex:none; }
+  .dot.ok { background:var(--on); } .dot.err { background:var(--err); }
+  .card { background:var(--card); border-radius:14px; padding:14px 16px; margin-bottom:10px; display:flex; align-items:center; gap:12px; }
+  .card .name { flex:1; font-weight:600; }
+  .card .sub { font-size:13px; color:var(--muted); font-weight:400; }
+  .lamp { width:14px; height:14px; border-radius:50%; background:var(--off); flex:none; }
+  .lamp.on { background:var(--on); box-shadow:0 0 8px var(--on); }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 16px; background:var(--accent); color:#fff; min-width:96px; }
+  button:disabled { opacity:.4; }
+  button.secondary { background:transparent; color:var(--accent); padding:6px 0; min-width:0; }
+  form { background:var(--card); border-radius:14px; padding:16px; }
+  label { display:block; font-size:14px; color:var(--muted); margin:10px 0 4px; }
+  input { width:100%; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--off); background:var(--bg); color:var(--text); }
+  form button { margin-top:16px; width:100%; }
+  .hidden { display:none; }
+  .err { color:var(--err); font-size:14px; margin-top:10px; }
+  .err:empty { display:none; }
+  .foot { margin-top:16px; font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<h1>Управление домом</h1>
+
+<form id="login" class="hidden">
+  <div>Введите логин и пароль MQTT один раз. Они сохранятся только на этом устройстве.</div>
+  <label for="user">Логин</label>
+  <input id="user" autocomplete="username" autocapitalize="off" value="web">
+  <label for="pass">Пароль</label>
+  <input id="pass" type="password" autocomplete="current-password">
+  <label><input type="checkbox" id="showPass" style="width:auto"> показать пароль</label>
+  <div id="loginErr" class="err"></div>
+  <button type="submit">Подключиться</button>
+</form>
+
+<div id="main" class="hidden">
+  <div class="status"><span id="dot" class="dot"></span><span id="statusText">Подключение…</span></div>
+  <div id="list"></div>
+  <div class="foot">
+    <span id="lastSeen">ПЛК ещё не прислал данные</span><br>
+    <button class="secondary" id="logout">Выйти (забыть пароль на этом устройстве)</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+// ===== Настройки =====
+const BROKER = "wss://q4717677.ala.eu-central-1.emqxsl.com:8084/mqtt";
+const TOPIC_STATE = "home/logo/state";
+const TOPIC_SET = "home/logo/set";
+const HEARTBEAT_KEY = "V..2:990-6";
+
+// Чтобы добавить выход или флаг: допишите строку сюда и включите его
+// в Cloud data transfer settings в LOGO Soft Comfort.
+// writable: true — появится кнопка (только для флагов M, выходы Q управляются программой).
+const ITEMS = [
+  { key: "Q..1:1-1", name: "Свет (Q1)", sub: "Выход" },
+  { key: "M..1:2-1", name: "Флаг M2",   sub: "Вкл/выкл с телефона", writable: true },
+];
+// =====================
+
+const $ = id => document.getElementById(id);
+const STORE = "logo-web-cred";
+const state = {};
+let client = null;
+
+function loadCred() { try { return JSON.parse(localStorage.getItem(STORE)); } catch { return null; } }
+function saveCred(c) { try { localStorage.setItem(STORE, JSON.stringify(c)); } catch {} }
+function clearCred() { try { localStorage.removeItem(STORE); } catch {} }
+
+function render() {
+  $("list").innerHTML = "";
+  for (const it of ITEMS) {
+    const v = state[it.key];
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `<span class="lamp ${v ? "on" : ""}"></span>
+      <div class="name">${it.name}<div class="sub">${v === undefined ? "нет данных" : v ? "Включено" : "Выключено"} · ${it.sub || ""}</div></div>`;
+    if (it.writable) {
+      // Пока состояние неизвестно (LOGO шлёт его только при изменении) — две кнопки.
+      const targets = v === undefined ? [true, false] : [!v];
+      for (const on of targets) {
+        const b = document.createElement("button");
+        b.textContent = v === undefined ? (on ? "Вкл" : "Выкл") : (on ? "Включить" : "Выключить");
+        if (targets.length > 1) b.style.minWidth = "64px";
+        b.disabled = !client || !client.connected;
+        b.onclick = () => setValue(it.key, on);
+        card.appendChild(b);
+      }
+    }
+    $("list").appendChild(card);
+  }
+}
+
+function setStatus(text, cls) {
+  $("statusText").textContent = text;
+  $("dot").className = "dot " + (cls || "");
+}
+
+// LOGO присылает значения в разных видах: "01", 1, [1], {"value":["01"]} — приводим к true/false.
+function toBool(v) {
+  if (v && typeof v === "object" && !Array.isArray(v)) v = v.value;
+  if (Array.isArray(v)) v = v[0];
+  if (typeof v === "string") return parseInt(v, 16) > 0;
+  return Boolean(v);
+}
+
+// Ищем ключи вида "Q..1:1-1" на любой глубине JSON (state / reported / desired).
+function collect(obj, out) {
+  if (!obj || typeof obj !== "object") return;
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === "desired") continue; // это эхо команды (LOGO сбрасывает его в null), а не состояние
+    if (/^[A-Za-z]+\.\.\d+:\d+-\d+$/.test(k)) out[k] = v;
+    else collect(v, out);
+  }
+}
+
+function onMessage(topic, payload) {
+  let data;
+  try { data = JSON.parse(payload.toString()); } catch { return; }
+  const found = {};
+  collect(data, found);
+  for (const it of ITEMS) if (it.key in found) state[it.key] = toBool(found[it.key]);
+  $("lastSeen").textContent = "Последние данные от ПЛК: " + new Date().toLocaleTimeString("ru-RU");
+  render();
+}
+
+function setValue(key, on) {
+  const msg = JSON.stringify({ state: { [key]: on ? "01" : "00" } });
+  client.publish(TOPIC_SET, msg, { qos: 1 });
+  setStatus("Команда отправлена, ждём ответ ПЛК…", "ok");
+}
+
+function connect(cred) {
+  $("login").classList.add("hidden");
+  $("main").classList.remove("hidden");
+  render();
+  setStatus("Подключение…");
+  client = mqtt.connect(BROKER, {
+    username: cred.user, password: cred.pass,
+    clientId: "web-" + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 3000, connectTimeout: 10000, clean: true,
+  });
+  client.on("connect", () => {
+    setStatus("Подключено", "ok");
+    client.subscribe(TOPIC_STATE, { qos: 1 });
+    render();
+  });
+  client.on("message", onMessage);
+  client.on("reconnect", () => setStatus("Переподключение…"));
+  client.on("offline", () => { setStatus("Нет связи с сервером", "err"); render(); });
+  client.on("error", err => {
+    const authFail = [4, 5, 134, 135].includes(err.code) || /not authorized|bad user/i.test(String(err.message || err));
+    if (authFail) {
+      client.end(true); clearCred();
+      showLogin(cred.user, "Сервер не принял логин или пароль (код " + err.code + "). Проверьте и введите ещё раз.");
+    } else setStatus("Ошибка: " + (err.message || err), "err");
+  });
+}
+
+function showLogin(user, error) {
+  $("main").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  $("loginErr").textContent = error || "";
+  if (user) $("user").value = user;
+}
+
+$("login").onsubmit = e => {
+  e.preventDefault();
+  const cred = { user: $("user").value.trim(), pass: $("pass").value };
+  if (!cred.user || !cred.pass) return;
+  saveCred(cred);
+  $("pass").value = "";
+  connect(cred);
+};
+$("showPass").onchange = e => { $("pass").type = e.target.checked ? "text" : "password"; };
+$("logout").onclick = () => { if (client) client.end(true); client = null; clearCred(); showLogin(); };
+
+// После возврата в Safari из фона — сразу переподключаемся.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && client && !client.connected) client.reconnect();
+});
+
+const saved = loadCred();
+saved ? connect(saved) : showLogin();
+</script>
+</body>
+</html>
